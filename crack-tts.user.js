@@ -1,7 +1,7 @@
     // ==UserScript==
 // @name         🔊 crack TTS
 // @namespace    http://tampermonkey.net/
-// @version      1.4.1-final
+// @version      1.4.2-auto-dubfix
 // @description  Crack TTS + 전체재생 / Firebase 전처리 / 더빙 / 캐릭터별 음성·더빙 튜닝 / 자동 지문 읽기 간격
 // @author       뤼붕이 + Dub patch
 // @match        https://crack.wrtn.ai/*
@@ -58,6 +58,7 @@
 
     const DEFAULT_PATCH = {
         enabled: true,
+        autoAssistantEnabled: false, // 원본 자동재생 UI를 그대로 쓰되 실행은 패치 파이프라인이 담당
         preprocessEnabled: false,
         dubEnabled: false,
         dubLanguage: 'ja',
@@ -87,6 +88,11 @@
         pitchWorkletReady: null,
         pitchWorkletUrl: '',
         pendingAudioTuning: null,
+        autoTimer: null,
+        autoObservedSession: '',
+        autoLatestObserved: null,
+        autoEpoch: 0,
+        autoSeen: new Set(),
     };
 
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -197,6 +203,7 @@
         // v1 호환: japaneseDub 값이 남아 있으면 새 더빙 토글로 승계합니다.
         if (typeof c.dubEnabled !== 'boolean' && typeof c.japaneseDub === 'boolean') c.dubEnabled = c.japaneseDub;
         c.enabled = c.enabled !== false;
+        c.autoAssistantEnabled = c.autoAssistantEnabled === true;
         c.preprocessEnabled = c.preprocessEnabled !== false;
         c.dubEnabled = c.dubEnabled === true;
         if (!DUB_LANGUAGES[c.dubLanguage]) c.dubLanguage = 'ja';
@@ -949,9 +956,11 @@ ${charRules}\n규칙이 지정된 화자는 자연스러운 문법을 유지하�
         document.querySelectorAll('.ct-jp-play-all').forEach(el => el.classList.remove('playing'));
     }
 
-    async function playWholeResponse(group, toolbar) {
+    async function playWholeResponse(group, toolbar, automatic = false) {
         if (Object.values(runtime.config.speakerVoiceTuning || {}).some(value => Math.abs(Number(value?.pitch) || 0) >= 0.01)) ensurePitchAudioContext().catch(() => {});
         if (runtime.playing) {
+            // 자동재생 신호가 겹친 경우 현재 재생을 끊지 않습니다.
+            if (automatic) return;
             stopPatchedPlayback();
             return;
         }
@@ -1180,6 +1189,123 @@ ${charRules}\n규칙이 지정된 화자는 자연스러운 문법을 유지하�
         };
     }
 
+
+    async function migrateOriginalAutoMode() {
+        const base = await loadBaseConfig();
+        if (!base || base.triggerMode !== 'auto-assistant') return false;
+
+        // 원본 자동재생은 번역/캐릭터 튜닝 패치를 우회합니다.
+        // 기존 선택값은 패치 설정으로 승계하고 원본 엔진 자체는 manual로 고정합니다.
+        runtime.config.autoAssistantEnabled = true;
+        normalizePatchConfig();
+        await storage.set(PATCH_CONFIG_KEY, JSON.stringify(runtime.config));
+        base.triggerMode = 'manual';
+        await storage.set(BASE_CONFIG_KEY, JSON.stringify(base));
+
+        // 원본 스크립트는 이미 메모리에 auto-assistant를 읽었을 수 있으므로 최초 1회만 새로고침합니다.
+        const reloadKey = 'ctJpAutoDubMigrationReloadV1';
+        try {
+            if (sessionStorage.getItem(reloadKey) !== '1') {
+                sessionStorage.setItem(reloadKey, '1');
+                location.reload();
+                return true;
+            }
+        } catch (_) {}
+        return false;
+    }
+
+    function injectOriginalAutoModeBridge() {
+        const modal = document.querySelector('#crack-tts-modal');
+        const trigger = modal?.querySelector('#ct-trigger');
+        if (!modal || !trigger) return;
+
+        if (typeof modal.__ctJpAutoDraft !== 'boolean') {
+            modal.__ctJpAutoDraft = !!runtime.config.autoAssistantEnabled;
+        }
+        if (!trigger.dataset.jpAutoBridgeBound) {
+            trigger.dataset.jpAutoBridgeBound = '1';
+            trigger.addEventListener('change', () => {
+                modal.__ctJpAutoDraft = trigger.value === 'auto-assistant';
+            });
+        }
+        // 화면에는 사용자가 선택한 원래 옵션을 그대로 보여 줍니다.
+        trigger.value = modal.__ctJpAutoDraft ? 'auto-assistant' : 'manual';
+
+        const form = modal.querySelector('form');
+        if (form && !form.dataset.jpAutoBridgeSaveBound) {
+            form.dataset.jpAutoBridgeSaveBound = '1';
+            form.addEventListener('submit', () => {
+                runtime.config.autoAssistantEnabled = !!modal.__ctJpAutoDraft;
+                // 원본 엔진은 반드시 manual로 저장해 한국어 원문 자동재생을 막습니다.
+                const currentTrigger = modal.querySelector('#ct-trigger');
+                if (currentTrigger) currentTrigger.value = 'manual';
+                clearTimeout(runtime.autoTimer);
+                runtime.autoEpoch++;
+                savePatchConfig();
+            }, true);
+        }
+    }
+
+    function latestRealMessageGroup() {
+        return [...document.querySelectorAll('div[data-message-group-id]')]
+            .find(group => !String(group.dataset.messageGroupId || '').startsWith(TEMP_GROUP_PREFIX)) || null;
+    }
+
+    function schedulePatchedAutoPlayback() {
+        const group = latestRealMessageGroup();
+        const markdown = group?.querySelector('.wrtn-markdown');
+        const sid = currentPatchSessionId();
+        const current = group && markdown ? {
+            id: String(group.dataset.messageGroupId || ''),
+            text: cleanText(markdown.innerText || markdown.textContent || ''),
+            role: messageRole(group)
+        } : null;
+
+        if (runtime.autoObservedSession !== sid) {
+            runtime.autoObservedSession = sid;
+            runtime.autoLatestObserved = current;
+            runtime.autoSeen.clear();
+            clearTimeout(runtime.autoTimer);
+            runtime.autoEpoch++;
+            return;
+        }
+
+        // 자동재생이 OFF일 때도 현재 위치는 갱신해 두어, ON으로 바꾼 순간 과거 응답을 읽지 않게 합니다.
+        if (!runtime.config.autoAssistantEnabled) {
+            runtime.autoLatestObserved = current;
+            clearTimeout(runtime.autoTimer);
+            runtime.autoEpoch++;
+            return;
+        }
+        if (!current) return;
+        const previous = runtime.autoLatestObserved;
+        if (previous && previous.id === current.id && previous.text === current.text) return;
+        runtime.autoLatestObserved = current;
+        clearTimeout(runtime.autoTimer);
+        const epoch = ++runtime.autoEpoch;
+        if (current.role !== 'assistant' || !current.text) return;
+        runtime.autoTimer = setTimeout(() => autoPlayStablePatchedResponse(group, current, sid, epoch), 2500);
+    }
+
+    async function autoPlayStablePatchedResponse(group, current, sid, epoch) {
+        if (epoch !== runtime.autoEpoch || sid !== currentPatchSessionId() || !runtime.config.autoAssistantEnabled) return;
+        const newest = latestRealMessageGroup();
+        if (newest !== group || !group.isConnected || messageRole(group) !== 'assistant') return;
+        const markdown = group.querySelector('.wrtn-markdown');
+        if (!markdown) return;
+        const freshText = cleanText(markdown.innerText || markdown.textContent || '');
+        if (freshText !== current.text) return;
+        const signature = current.id + ':' + current.text;
+        if (runtime.autoSeen.has(signature)) return;
+
+        createToolbar(group);
+        const toolbar = group.querySelector('.ct-jp-dub-toolbar');
+        if (!toolbar) return;
+        runtime.autoSeen.add(signature);
+        if (runtime.autoSeen.size > 100) runtime.autoSeen.delete(runtime.autoSeen.values().next().value);
+        await playWholeResponse(group, toolbar, true);
+    }
+
     async function injectIntoOriginalPreprocessTab() {
         const modal = document.querySelector('#crack-tts-modal');
         const preprocessToggle = modal?.querySelector('#ct-ai-preprocess');
@@ -1367,21 +1493,34 @@ ${charRules}\n규칙이 지정된 화자는 자연스러운 문법을 유지하�
         const observer = new MutationObserver(records => {
             if (records.every(record => record.target?.closest?.('.ct-jp-temp-group,#ct-jp-dub-modal,.ct-jp-dub-toolbar'))) return;
             clearTimeout(timer);
-            timer = setTimeout(() => { scan(); injectIntoOriginalPreprocessTab(); injectIntoOriginalCharacterTab(); }, 180);
+            timer = setTimeout(() => {
+                scan();
+                injectIntoOriginalPreprocessTab();
+                injectIntoOriginalCharacterTab();
+                injectOriginalAutoModeBridge();
+                schedulePatchedAutoPlayback();
+            }, 180);
         });
         observer.observe(document.body, { childList: true, subtree: true, characterData: true });
     }
 
     async function start() {
         await loadPatchConfig();
+        if (await migrateOriginalAutoMode()) return;
         addStyles();
         installAudioPlayHook();
         applyVisibilityClasses();
         scan();
         injectIntoOriginalPreprocessTab();
         injectIntoOriginalCharacterTab();
+        injectOriginalAutoModeBridge();
+        schedulePatchedAutoPlayback();
         observe();
-        window.addEventListener('pagehide', stopPatchedPlayback);
+        window.addEventListener('pagehide', () => {
+            clearTimeout(runtime.autoTimer);
+            runtime.autoEpoch++;
+            stopPatchedPlayback();
+        });
     }
 
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
