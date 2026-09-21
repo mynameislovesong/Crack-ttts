@@ -417,11 +417,16 @@
         const raw = String(text || '');
         const chars = [...raw.replace(/\s+/g, '')].length;
         const punctuation = (raw.match(/[.!?。！？…]/g) || []).length;
-        if (!chars) return runtime.config.minNarrationPause;
         if (runtime.config.narrationPauseStrength === 'auto') {
-            const seconds = (chars / 7.5) + Math.min(2.4, punctuation * 0.16);
-            return Math.max(0.40, Math.min(30, seconds));
+            // Character chat pacing: keep the original 2s gap as the baseline,
+            // then extend only when the narration is long enough to matter.
+            // 25 chars/sec ≈ 1500 chars/min (fast-reading pace).
+            const readingSeconds = chars / 25;
+            const punctuationPause = Math.min(0.8, punctuation * 0.08);
+            const seconds = Math.max(2, readingSeconds + punctuationPause);
+            return Math.min(8, seconds);
         }
+        if (!chars) return runtime.config.minNarrationPause;
         let seconds;
         if (chars <= 4) seconds = 0.35;
         else if (chars <= 30) seconds = 0.55 + chars * 0.022;
@@ -1135,13 +1140,13 @@ ${charRules}\n규칙이 지정된 화자는 자연스러운 문법을 유지하�
               </label>
               <label class="ct-jp-field"><span>지문 대기 강도</span>
                 <select id="ct-jp-pause-strength">
-                  <option value="auto" ${runtime.config.narrationPauseStrength === 'auto' ? 'selected' : ''}>자동 · 평균 읽기속도</option>
+                  <option value="auto" ${runtime.config.narrationPauseStrength === 'auto' ? 'selected' : ''}>자동 · 속독 기준</option>
                   <option value="short" ${runtime.config.narrationPauseStrength === 'short' ? 'selected' : ''}>짧게</option>
                   <option value="normal" ${runtime.config.narrationPauseStrength === 'normal' ? 'selected' : ''}>보통</option>
                   <option value="long" ${runtime.config.narrationPauseStrength === 'long' ? 'selected' : ''}>길게</option>
                 </select>
               </label>
-              <div class="ct-jp-note">자동 모드는 대사 사이 지문을 약 <b>450자/분(7.5자/초)</b>의 평균 묵독 속도로 계산하고 문장부호 휴지를 더합니다. 긴 지문은 최대 30초까지 기다립니다.</div>
+              <div class="ct-jp-note">자동 모드는 원래 대사 간격인 <b>2초</b>를 기본으로 두고, 대사 사이 지문이 길 때만 약 <b>1500자/분(25자/초)</b>의 속독 기준으로 늘립니다. 아주 긴 지문도 최대 8초까지만 기다립니다.</div>
             </section>
             <footer><button type="button" class="ct-jp-secondary ct-jp-close">취소</button><button type="button" class="ct-jp-save">저장</button></footer>
           </div>`;
